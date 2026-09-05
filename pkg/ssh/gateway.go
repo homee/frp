@@ -20,6 +20,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -27,6 +28,17 @@ import (
 	"github.com/fatedier/frp/pkg/transport"
 	"github.com/fatedier/frp/pkg/util/log"
 	netpkg "github.com/fatedier/frp/pkg/util/net"
+)
+
+// A peer that disappears without closing its connection - a device that reboots,
+// a link that drops - keeps holding whatever it registered. Nothing else notices:
+// the tunnel's heartbeat writes into the socket without waiting for an answer, and
+// those writes keep succeeding until TCP stops retransmitting, which takes minutes.
+// Keepalive on the accepted connection settles it in about thirty seconds.
+const (
+	tunnelKeepAliveIdle     = 15 * time.Second
+	tunnelKeepAliveInterval = 5 * time.Second
+	tunnelKeepAliveCount    = 3
 )
 
 type Gateway struct {
@@ -118,6 +130,17 @@ func (g *Gateway) Close() error {
 
 func (g *Gateway) handleConn(conn net.Conn) {
 	defer conn.Close()
+
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		if err := tcpConn.SetKeepAliveConfig(net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     tunnelKeepAliveIdle,
+			Interval: tunnelKeepAliveInterval,
+			Count:    tunnelKeepAliveCount,
+		}); err != nil {
+			log.Warnf("set keepalive on ssh tunnel connection %v failed: %v", conn.RemoteAddr(), err)
+		}
+	}
 
 	ts, err := NewTunnelServer(conn, g.sshConfig, g.peerServerListener)
 	if err != nil {

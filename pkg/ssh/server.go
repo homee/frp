@@ -340,20 +340,64 @@ func parseExecPayload(payload []byte) (string, bool) {
 	return msg.Command, true
 }
 
+// The heartbeat is the only thing that can notice a peer which stopped answering
+// while its socket still accepts writes - a rebooted device, a wedged client. It
+// therefore asks for a reply and gives up when none arrives, rather than writing
+// into the void and reporting success.
+const (
+	heartbeatInterval = 30 * time.Second
+	heartbeatTimeout  = 15 * time.Second
+)
+
 func (s *TunnelServer) keepAlive(ch ssh.Channel) {
-	tk := time.NewTicker(time.Second * 30)
+	tk := time.NewTicker(heartbeatInterval)
 	defer tk.Stop()
 
 	for {
 		select {
 		case <-tk.C:
-			_, err := ch.SendRequest("heartbeat", false, nil)
-			if err != nil {
-				return
+			if s.heartbeatAnswered(ch) {
+				continue
 			}
+
+			// Close the tunnel rather than leave it registered: until this
+			// connection goes, its proxy name stays taken and the peer cannot
+			// register again when it comes back.
+			log.Warnf("ssh tunnel heartbeat unanswered after %v, closing the connection", heartbeatTimeout)
+			s.closeDoneChOnce.Do(func() {
+				_ = s.sshConn.Close()
+				close(s.doneCh)
+			})
+			return
 		case <-s.doneCh:
 			return
 		}
+	}
+}
+
+// heartbeatAnswered reports whether the peer answered at all. A client that does
+// not implement the request replies with a failure, which is an answer: RFC 4254
+// requires one whenever want_reply is set, so any reply proves the peer is alive.
+func (s *TunnelServer) heartbeatAnswered(ch ssh.Channel) bool {
+	// Buffered: SendRequest blocks until the peer answers or the channel breaks,
+	// so on a dead peer this goroutine outlives the timeout below and must still
+	// be able to finish.
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ch.SendRequest("heartbeat", true, nil)
+		errCh <- err
+	}()
+
+	timer := time.NewTimer(heartbeatTimeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-errCh:
+		return err == nil
+	case <-timer.C:
+		return false
+	case <-s.doneCh:
+		return true
 	}
 }
 
